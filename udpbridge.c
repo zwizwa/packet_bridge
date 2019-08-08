@@ -1,3 +1,9 @@
+/* NOTE THAT THIS IS VERY INSECURE
+   It's a plumbing tool.  Do not run this on an untrusted network.
+   UDP packets are sent to the last valid peer(s).
+*/
+
+
 #include "system.h"
 
 #include <stdio.h>
@@ -35,27 +41,15 @@ static inline void log_packet(uint8_t *buf, ssize_t n) {
     LOG("\n");
 }
 
-static inline void test_send(int fd) {
-    while(1) {
-        sleep(1);
-        uint8_t test[] = {
-            0xff,0xff,0xff,0xff,0xff,0xff,
-            0xff,0xff,0xff,0xff,0xff,0xff,
-            0x20,0x20,
-            1,2,3,4
-        };
-        write(fd, &test[0], sizeof(test));
-    }
+static void log_addr(struct sockaddr_in *sa) {
+    uint8_t *a = (void*)&sa->sin_addr;
+    LOG("%d.", a[0]);
+    LOG("%d.", a[1]);
+    LOG("%d.", a[2]);
+    LOG("%d:", a[3]);
+    LOG("%d\n", ntohs(sa->sin_port));
 }
-static inline void test_recv(int fd, const char *ifname) {
-    while(1) {
-        uint8_t buf[2048];
-        ssize_t nbytes;
-        ASSERT((nbytes = read(fd, &buf[0], sizeof(buf))) > 0);
-        LOG("%s: (%d)\n", ifname, (int)nbytes);
-        log_packet(&buf[0], nbytes);
-    }
-}
+
 
 // Sockets and tap are different, so wrap behind interface.
 struct port;
@@ -99,22 +93,26 @@ struct udp_port {
 };
 
 static ssize_t udp_read(struct udp_port *p, uint8_t *buf, ssize_t len) {
-    /* NOTE THAT THIS IS VERY INSECURE
-       We send data where ever we got it from last.
-       FIXME: At least do an IP check or something. */
     ssize_t rlen;
     int flags = 0;
     socklen_t addrlen = sizeof(&p->peer);
+    struct sockaddr_in peer;
     ASSERT_ERRNO(
         rlen = recvfrom(p->p.fd, buf, len, flags,
-                        (struct sockaddr*)&p->peer, &addrlen));
+                        (struct sockaddr*)&peer, &addrlen));
     //LOG("addrlen %d %d\n", addrlen, sizeof(p->peer));
-    ASSERT(addrlen == sizeof(p->peer));
+    ASSERT(addrlen == sizeof(peer));
+
+    if (memcmp(&p->peer, &peer, sizeof(peer))) {
+        memcpy(&p->peer, &peer, sizeof(peer));
+        log_addr(&peer);
+    }
+
     return rlen;
 }
 static ssize_t udp_write(struct udp_port *p, uint8_t *buf, ssize_t len) {
     if (p->peer.sin_port == 0) {
-        LOG("drop %d\n", (int)len);
+        //LOG("drop %d\n", (int)len);
         return len; // this is not an error
     }
     ssize_t wlen;
@@ -145,11 +143,13 @@ static inline struct port *open_udp(u_short port) {
     p->p.read  = (port_read)udp_read;
     p->p.write = (port_write)udp_write;
 
-    //struct hostent *hp;
-    //ASSERT(hp = gethostbyname(host));
-    //memcpy((char *)&p->peer.sin_addr, (char *)hp->h_addr, hp->h_length);
-    //p->peer.sin_port = htons(port);
-    //p->peer.sin_family = AF_INET;
+    /* if (host) { */
+    /*     struct hostent *hp; */
+    /*     ASSERT(hp = gethostbyname(host)); */
+    /*     memcpy((char *)&p->peer.sin_addr, (char *)hp->h_addr, hp->h_length); */
+    /*     p->peer.sin_port = htons(port); */
+    /*     p->peer.sin_family = AF_INET; */
+    /* } */
     return &p->p;
 }
 
@@ -192,6 +192,27 @@ static inline int main_udp2tap(int argc, char **argv) {
 
     return 0;
 }
+
+// What i want here is to just specify a single udp port, and have the
+// two last clients interchange messages.  But it does work with two
+// ports.
 static inline int main_udp2udp(int argc, char **argv) {
+    ASSERT(argc > 2);
+    struct port* port[] = {
+        open_udp(atoi(argv[1])),
+        open_udp(atoi(argv[2])),
+    };
+    //test_send(fd[0]);
+    //test_recv(fd[0], argv[1]);
+    proxy(&port[0]);
+
     return 0;
+}
+
+int main(int argc, char **argv) {
+    ASSERT(argc > 1);
+    if (!strcmp("udp2tap", argv[1])) return main_udp2tap(argc-1,argv+1);
+    if (!strcmp("udp2udp", argv[1])) return main_udp2udp(argc-1,argv+1);
+    LOG("bad subprogram %s\n", argv[1]);
+    exit(1);
 }
