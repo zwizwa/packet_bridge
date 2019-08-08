@@ -1,4 +1,4 @@
-/* NOTE THAT THIS IS VERY INSECURE
+/* NOTE THAT THIS IS VERY INSECUREu_
    It's a plumbing tool.  Do not run this on an untrusted network.
    UDP packets are sent to the last valid peer(s).
 */
@@ -28,6 +28,7 @@
 #include <poll.h>
 
 #include <netdb.h>
+
 
 // https://stackoverflow.com/questions/1003684/how-to-interface-with-the-linux-tun-driver
 // https://www.kernel.org/doc/Documentation/networking/tuntap.txt
@@ -124,7 +125,7 @@ static ssize_t udp_write(struct udp_port *p, uint8_t *buf, ssize_t len) {
     return wlen;
 }
 
-static inline struct port *open_udp(u_short port) {
+static inline struct port *open_udp(uint16_t port) {
     int fd;
     struct sockaddr_in address = {
         .sin_port = htons(port),
