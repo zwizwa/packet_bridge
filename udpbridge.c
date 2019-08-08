@@ -195,7 +195,8 @@ static inline int main_udp2tap(int argc, char **argv) {
 
 // What i want here is to just specify a single udp port, and have the
 // two last clients interchange messages.  But it does work with two
-// ports.
+// ports.  Maybe that is better anyway: this way one end can restart
+// while the other remains "connected".
 static inline int main_udp2udp(int argc, char **argv) {
     ASSERT(argc > 2);
     struct port* port[] = {
@@ -216,3 +217,25 @@ int main(int argc, char **argv) {
     LOG("bad subprogram %s\n", argv[1]);
     exit(1);
 }
+
+
+
+/* Notes
+
+- It seems that this needs to somehow be a-symmetric, since somebody
+  needs to initiate the chain setup.  Assume that chain setup can be
+  done through another channel, e.g. ssh, what is needed is:
+
+  - farthest point:
+    - UDP listening socket
+    - tap, bridged to remote interface
+
+  - midpoint(s)
+    - UDP listening socket
+    - UDP connecting socket
+
+  - nearest point
+    - UDP connecting socket
+    - tap, bridged to local interface
+
+*/
