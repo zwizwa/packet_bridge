@@ -10,6 +10,11 @@ br0() {
 	brctl addif br0 tap0
 	wait
 }
+proxy() {
+	killall udpbridge.elf
+	($ELF UDP-CONNECT:172.30.3.222:1234 UDP-LISTEN:1234)&
+	wait
+}
 
 
 # Crude but simple test
