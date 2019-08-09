@@ -1,6 +1,9 @@
-/* NOTE THAT THIS IS VERY INSECUREu_
-   It's a plumbing tool.  Do not run this on an untrusted network.
-   UDP packets are sent to the last valid peer(s).
+/* This is a testing tool.  Don't shoot yourself in the foot.
+
+   For ease of configuration, UDP packets are sent to the first peer
+   that sends a message to a listening socket and ignored afterwards.
+   If you know the UDP address, you can essentially gain unrestricted
+   raw Ethernet access to whatever the tap interface is bridged to.
 */
 
 
@@ -52,7 +55,7 @@ static void log_addr(struct sockaddr_in *sa) {
 }
 
 
-// Sockets and tap are different, so wrap behind interface.
+// Sockets and taps are different, so wrap behind interface.
 struct port;
 typedef ssize_t (*port_read)(struct port *, uint8_t *, ssize_t);
 typedef ssize_t (*port_write)(struct port *, uint8_t *, ssize_t);
@@ -62,18 +65,17 @@ struct port {
     port_write write;
 };
 
-static ssize_t fd_read(struct port *p, uint8_t *buf, ssize_t len) {
+static ssize_t tap_read(struct port *p, uint8_t *buf, ssize_t len) {
     ssize_t rlen;
     ASSERT_ERRNO(rlen = read(p->fd, buf, len));
     return rlen;
 }
-static ssize_t fd_write(struct port *p, uint8_t *buf, ssize_t len) {
-    ssize_t wlen;
-    ASSERT_ERRNO(wlen = write(p->fd, buf, len));
-    return wlen;
+static ssize_t tap_write(struct port *p, uint8_t *buf, ssize_t len) {
+    // EIO is normal until iface is set up
+    return write(p->fd, buf, len);
 }
 
-static inline struct port *open_tap(char *dev) {
+static inline struct port *open_tap(const char *dev) {
     int fd;
     ASSERT_ERRNO(fd = open("/dev/net/tun", O_RDWR));
     struct ifreq ifr = { .ifr_flags = IFF_TAP | IFF_NO_PI };
@@ -83,8 +85,8 @@ static inline struct port *open_tap(char *dev) {
     struct port *port;
     ASSERT(port = malloc(sizeof(*port)));
     port->fd = fd;
-    port->read = fd_read;
-    port->write = fd_write;
+    port->read = tap_read;
+    port->write = tap_write;
     return port;
 }
 
@@ -96,25 +98,33 @@ struct udp_port {
 static ssize_t udp_read(struct udp_port *p, uint8_t *buf, ssize_t len) {
     ssize_t rlen;
     int flags = 0;
-    socklen_t addrlen = sizeof(&p->peer);
-    struct sockaddr_in peer;
+    struct sockaddr_in peer = {};
+    socklen_t addrlen = sizeof(&peer);
     ASSERT_ERRNO(
         rlen = recvfrom(p->p.fd, buf, len, flags,
                         (struct sockaddr*)&peer, &addrlen));
-    //LOG("addrlen %d %d\n", addrlen, sizeof(p->peer));
     ASSERT(addrlen == sizeof(peer));
 
-    if (memcmp(&p->peer, &peer, sizeof(peer))) {
+    /* Associate to first peer that sends to us.  This is to make
+       setup simpler. */
+    if (!p->peer.sin_port) {
         memcpy(&p->peer, &peer, sizeof(peer));
         log_addr(&peer);
+        return rlen;
+    }
+    /* After that, drop packets that do not come from peer. */
+    if(memcmp(&p->peer, &peer, sizeof(peer))) {
+        LOG("WARNING: ununknown sender %d:\n", sizeof(peer));
+        log_addr(&peer);
+        //log_addr(&p->peer);
+        return 0;
     }
 
-    return rlen;
 }
 static ssize_t udp_write(struct udp_port *p, uint8_t *buf, ssize_t len) {
     if (p->peer.sin_port == 0) {
-        //LOG("drop %d\n", (int)len);
-        return len; // this is not an error
+        /* Drop while not assicated */
+        return 0;
     }
     ssize_t wlen;
     int flags = 0;
@@ -127,16 +137,20 @@ static ssize_t udp_write(struct udp_port *p, uint8_t *buf, ssize_t len) {
 
 static inline struct port *open_udp(uint16_t port) {
     int fd;
-    struct sockaddr_in address = {
-        .sin_port = htons(port),
-        .sin_family = AF_INET
-    };
     ASSERT_ERRNO(fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
-    ASSERT_ERRNO(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)));
-    socklen_t addrlen = sizeof(address);
-    ASSERT_ERRNO(bind(fd, (struct sockaddr *)&address, addrlen));
-    LOG("udp: %d\n", port);
-
+    if(port) {
+        struct sockaddr_in address = {
+            .sin_port = htons(port),
+            .sin_family = AF_INET
+        };
+        ASSERT_ERRNO(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)));
+        socklen_t addrlen = sizeof(address);
+        ASSERT_ERRNO(bind(fd, (struct sockaddr *)&address, addrlen));
+        LOG("udp: port %d\n", port);
+    }
+    else {
+        LOG("udp: not bound\n");
+    }
     struct udp_port *p;
     ASSERT(p = malloc(sizeof(*p)));
     memset(p,0,sizeof(*p));
@@ -144,22 +158,13 @@ static inline struct port *open_udp(uint16_t port) {
     p->p.read  = (port_read)udp_read;
     p->p.write = (port_write)udp_write;
 
-    /* if (host) { */
-    /*     struct hostent *hp; */
-    /*     ASSERT(hp = gethostbyname(host)); */
-    /*     memcpy((char *)&p->peer.sin_addr, (char *)hp->h_addr, hp->h_length); */
-    /*     p->peer.sin_port = htons(port); */
-    /*     p->peer.sin_family = AF_INET; */
-    /* } */
     return &p->p;
 }
 
-/* FIXME: I'm fundamentally misunderstanding something.  I want all
- * incoming UDP packets to arrive at the tap, and I want to send the
- * tap incoming to a particular host. */
-
-
 static inline void proxy(struct port **port) {
+    const char progress[] = "-\\|/";
+    uint32_t count = 0;
+
     struct pollfd pfd[2] = {};
     for (int i=0; i<2; i++) {
         pfd[i].fd = port[i]->fd;
@@ -173,70 +178,121 @@ static inline void proxy(struct port **port) {
         for (int i=0; i<2; i++) {
             if(pfd[i].revents & POLLIN) {
                 int rlen = port[i]->read(port[i], buf, sizeof(buf));
-                LOG("%d %d\n", i, rlen);
-                int wlen = port[1-i]->write(port[1-i], buf, rlen);
-                ASSERT(rlen == wlen);
+                if (rlen) {
+                    // LOG("%d %d\n", i, rlen);
+                    port[1-i]->write(port[1-i], buf, rlen);
+                    LOG("\r%c", progress[count % sizeof(progress)]);
+                    count++;
+                }
+                else {
+                    /* Port handler read data but dropped it. */
+                }
             }
         }
     }
 }
 
-static inline int main_udp2tap(int argc, char **argv) {
-    ASSERT(argc > 2);
-    struct port* port[] = {
-        open_tap(argv[1]),
-        open_udp(atoi(argv[2]))
-    };
-    //test_send(fd[0]);
-    //test_recv(fd[0], argv[1]);
-    proxy(&port[0]);
 
-    return 0;
-}
+/* To set up UDP someone needs to send a first packet.  All other
+   packets will go back to the first peer.  These are the
+   configurations:
 
-// What i want here is to just specify a single udp port, and have the
-// two last clients interchange messages.  But it does work with two
-// ports.  Maybe that is better anyway: this way one end can restart
-// while the other remains "connected".
-static inline int main_udp2udp(int argc, char **argv) {
-    ASSERT(argc > 2);
-    struct port* port[] = {
-        open_udp(atoi(argv[1])),
-        open_udp(atoi(argv[2])),
-    };
-    //test_send(fd[0]);
-    //test_recv(fd[0], argv[1]);
-    proxy(&port[0]);
+   udp2udp <port1> <port2> [<dst_host> <dst_port>]
 
-    return 0;
-}
+   tap2udp <tap>   <port>  [<dst_host> <dst_port>]
 
-int main(int argc, char **argv) {
-    ASSERT(argc > 1);
-    if (!strcmp("udp2tap", argv[1])) return main_udp2tap(argc-1,argv+1);
-    if (!strcmp("udp2udp", argv[1])) return main_udp2udp(argc-1,argv+1);
-    LOG("bad subprogram %s\n", argv[1]);
-    exit(1);
-}
+   dst_host, dst_port are optional.  If present, a first packet is
+   sent to initate communication.
+
+   It seems that will solve all topologies.
+
+   EDIT: I need to think about this some more.  Problem is that I
+   don't understand UDP very well, i.e.: how can I let the OS pick a
+   port?  Because in the a-symmetric situation, I want one listening
+   port that is well known, but the other port can be arbitrary since
+   it will be chained to the next hop, and that one will reply to any
+   port that is specified.  I think I get it now, just figure out how
+   to do this.  I guess this just boils down to binding or not.
+
+   So what about this: add L: or C: prefixes to set up the initial
+   direction of the socket.
+
+   Follow socat suntax:
+
+   TAP:tap0
+   UDP4-LISTEN:port
+   UDP4:host:port
 
 
-
-/* Notes
-
-- It seems that this needs to somehow be a-symmetric, since somebody
-  needs to initiate the chain setup.  Assume that chain setup can be
-  done through another channel, e.g. ssh, what is needed is:
-
-  - farthest point:
-    - UDP listening socket
-    - tap, bridged to remote interface
-
-  - midpoint(s)
-    - UDP listening socket
-    - UDP connecting socket
-
-  - nearest point
-    - UDP connecting socket
-    - tap, bridged to local interface
+   Setup:
+   - ssh to the endpoint, start udp-listen A + tap
+   - ssh to the midpont,  start udp-listen B + udp-connect to A
+   - .. other midpoints ..
+   - local: start tap + udp-connect to B
+   - gather all pids doing so and close ssh connections
+   - monitor connection, if it goes down tear down old and rebuild
 
 */
+
+struct port *from_portspec(char *spec) {
+    const char delim[] = ":";
+    char *tok;
+    ASSERT(tok = strtok(spec, delim));
+
+    if (!strcmp(tok, "TAP")) {
+        ASSERT(tok = strtok(NULL, delim));
+        const char *tapdev = tok;
+        ASSERT(NULL == (tok = strtok(NULL, delim)));
+        //LOG("TAP:%s\n", tapdev);
+        return open_tap(tapdev);
+    }
+
+    if (!strcmp(tok, "UDP-LISTEN")) {
+        ASSERT(tok = strtok(NULL, delim));
+        uint16_t port = atoi(tok);
+        ASSERT(NULL == (tok = strtok(NULL, delim)));
+        //LOG("UDP-LISTEN:%d\n", port);
+        return open_udp(port);
+    }
+
+    if (!strcmp(tok, "UDP")) {
+        ASSERT(tok = strtok(NULL, delim));
+        const char *host = tok;
+        ASSERT(tok = strtok(NULL, delim));
+        uint16_t port = atoi(tok);
+        ASSERT(NULL == (tok = strtok(NULL, delim)));
+        //LOG("UDP-LISTEN:%s:%d\n", host, port);
+
+        struct port *p = open_udp(0); // don't spec port here
+        struct udp_port *up = (void*)p;
+
+        struct hostent *hp;
+        ASSERT(hp = gethostbyname(host));
+        memcpy((char *)&up->peer.sin_addr,
+               (char *)hp->h_addr_list[0],
+               hp->h_length);
+        up->peer.sin_port = htons(port);
+        up->peer.sin_family = AF_INET;
+
+        // FIXME: Send some meaningful ethernet packet instead
+        uint8_t buf[] = {
+            0x55,0x55,0x55,0x55,0x55,0x55,
+            0x55,0x55,0x55,0x55,0x55,0x55,
+            0x55,0x55
+        };
+        LOG("udp: hello to ");
+        log_addr(&up->peer);
+        ASSERT(sizeof(buf) == p->write(p, buf, sizeof(buf)));
+        return p;
+    }
+    ERROR("unknown type %s\n", tok);
+}
+
+
+int main(int argc, char **argv) {
+    ASSERT(argc > 2);
+    struct port *port[2];
+    ASSERT(port[0] = from_portspec(argv[1]));
+    ASSERT(port[1] = from_portspec(argv[2]));
+    proxy(port);
+}
