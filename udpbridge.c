@@ -33,6 +33,13 @@
 #include <netdb.h>
 
 
+//#include "/usr/include/asm-generic/termbits.h"
+//#include "/usr/include/asm-generic/ioctls.h"
+
+#include <asm-generic/termbits.h>
+#include <asm-generic/ioctls.h>
+
+
 // https://stackoverflow.com/questions/1003684/how-to-interface-with-the-linux-tun-driver
 // https://www.kernel.org/doc/Documentation/networking/tuntap.txt
 // https://wiki.wireshark.org/Development/LibpcapFileFormat
@@ -96,7 +103,8 @@ struct udp_port {
 };
 
 static ssize_t udp_read(struct udp_port *p, uint8_t *buf, ssize_t len) {
-    ssize_t rlen;
+    //LOG("udp_read\n");
+    ssize_t rlen = 0;
     int flags = 0;
     struct sockaddr_in peer = {};
     socklen_t addrlen = sizeof(&peer);
@@ -110,15 +118,19 @@ static ssize_t udp_read(struct udp_port *p, uint8_t *buf, ssize_t len) {
     if (!p->peer.sin_port) {
         memcpy(&p->peer, &peer, sizeof(peer));
         log_addr(&peer);
-        return rlen;
+        goto done;
     }
     /* After that, drop packets that do not come from peer. */
     if(memcmp(&p->peer, &peer, sizeof(peer))) {
         LOG("WARNING: ununknown sender %d:\n", sizeof(peer));
         log_addr(&peer);
         //log_addr(&p->peer);
-        return 0;
+        rlen = 0;
+        goto done;
     }
+  done:
+    //LOG("udp_read %d\n", rlen);
+    return rlen;
 
 }
 static ssize_t udp_write(struct udp_port *p, uint8_t *buf, ssize_t len) {
@@ -161,6 +173,124 @@ static inline struct port *open_udp(uint16_t port) {
     return &p->p;
 }
 
+#if 1  // needs testing
+
+/* For byte streams, some kind of framing is necessary, so use Erlang
+ * {packet,N} where every packet is prefixed with a big endian short
+ * unsigned int with packet length. */
+
+struct stream_port {
+    struct port p;
+    uint32_t count;
+    uint32_t len_bytes;
+    uint8_t buf[2048];
+};
+
+uint32_t stream_packet_size(struct stream_port *p) {
+    ASSERT(p->len_bytes <= 4);
+    ASSERT(p->count >= p->len_bytes);
+    uint32_t size = 0;
+    for (uint32_t i=0; i<p->len_bytes; i++) {
+        size = (size << 8) + p->buf[i];
+    }
+    //LOG("size %d\n", size);
+    return size;
+}
+uint32_t stream_packet_write_size(struct stream_port *p, uint32_t size, uint8_t *buf) {
+    ASSERT(p->len_bytes <= 4);
+    for (uint32_t i=0; i<p->len_bytes; i++) {
+        buf[p->len_bytes-1-i] = size & 0xFF;
+        size = size >> 8;
+    }
+    return size;
+}
+
+static ssize_t stream_pop(struct stream_port *p, uint8_t *buf, ssize_t len) {
+    if (p->count < p->len_bytes) return 0; // no size header
+    uint32_t size = stream_packet_size(p);
+    if (sizeof(p->buf) < p->len_bytes + size) {
+        /* Keep buffer small as this is intended for Ethernet.  It
+         * will cause early failure for bad protocol data. */
+        ERROR("buffer overflow for stream packet size=%d\n", size);
+    }
+    if (p->count < p->len_bytes + size) return 0; // not complete
+    ASSERT(size <= len);
+    memcpy(buf, &p->buf[p->len_bytes], size);
+    ssize_t tail_count = p->count - (p->len_bytes + size);
+    if (tail_count) {
+        memmove(&p->buf[0], &p->buf[p->count], tail_count);
+    }
+    p->count = tail_count;
+    LOG("pop: %d %d\n", size, p->count);
+    return size;
+}
+static ssize_t stream_read(struct stream_port *p, uint8_t *buf, ssize_t len) {
+    ssize_t size;
+    /* If we still have a packet, return that first. */
+    if ((size = stream_pop(p, buf, len))) return size;
+
+
+
+    /* We get only one read, so make it count. */
+    uint32_t room = sizeof(p->buf) - p->count;
+    //LOG("stream_read\n");
+    ssize_t rv = read(p->p.fd, &p->buf[p->count], room);
+    //LOG("stream_read done %d\n", rv);
+    if (rv == -1) {
+        switch (errno) {
+        case EAGAIN:
+            return 0;
+        default:
+            ASSERT_ERRNO(-1);
+        }
+    }
+    p->count += rv;
+    return stream_pop(p, buf, len);
+}
+static ssize_t stream_write(struct stream_port *p, uint8_t *buf, ssize_t len) {
+    //LOG("stream_write %d\n", len);
+    uint8_t size[p->len_bytes];
+    stream_packet_write_size(p, len, &size[0]);
+    // FIXME: this might not be properly buffered..
+    ASSERT(p->len_bytes == write(p->p.fd, &size[0], p->len_bytes));
+    ASSERT(len          == write(p->p.fd, buf, len));
+    //LOG("stream_write %d (done)\n", len);
+    return len + p->len_bytes;
+}
+static inline struct port *open_stream(uint32_t len_bytes, int fd) {
+    struct stream_port *p;
+    ASSERT(p = malloc(sizeof(*p)));
+    memset(p,0,sizeof(*p));
+    p->p.fd = fd;
+    p->p.read  = (port_read)stream_read;
+    p->p.write = (port_write)stream_write;
+    p->len_bytes = len_bytes;
+    return &p->p;
+}
+static inline struct port *open_tty(uint32_t len_bytes, const char *dev) {
+    int fd;
+    ASSERT_ERRNO(fd = open(dev, O_RDWR | O_NONBLOCK));
+
+    struct termios2 tio;
+    ASSERT(0 == ioctl(fd, TCGETS2, &tio));
+
+    // http://www.cs.uleth.ca/~holzmann/C/system/ttyraw.c
+    tio.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    tio.c_oflag &= ~(OPOST);
+    tio.c_cflag |= (CS8);
+    tio.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+    tio.c_cc[VMIN] = 1;
+    tio.c_cc[VTIME] = 0;
+
+    ASSERT(0 == ioctl(fd, TCSETS2, &tio));
+
+    return open_stream(len_bytes, fd);
+}
+
+#endif
+
+
+
 static inline void proxy(struct port **port) {
     const char progress[] = "-\\|/";
     uint32_t count = 0;
@@ -177,11 +307,16 @@ static inline void proxy(struct port **port) {
         ASSERT(rv >= 0);
         for (int i=0; i<2; i++) {
             if(pfd[i].revents & POLLIN) {
-                int rlen = port[i]->read(port[i], buf, sizeof(buf));
+                struct port *in  = port[i];
+                struct port *out = port[1-i];
+
+                int rlen = in->read(in, buf, sizeof(buf));
                 if (rlen) {
-                    // LOG("%d %d\n", i, rlen);
-                    port[1-i]->write(port[1-i], buf, rlen);
-                    LOG("\r%c", progress[count % sizeof(progress)]);
+                    //LOG("%d: %d\n", i, rlen);
+                    //log_packet(buf, rlen);
+
+                    out->write(out, buf, rlen);
+                    LOG("\r%c (%d)", progress[count % 4], count);
                     count++;
                 }
                 else {
@@ -285,6 +420,16 @@ struct port *from_portspec(char *spec) {
         ASSERT(sizeof(buf) == p->write(p, buf, sizeof(buf)));
         return p;
     }
+
+    if (!strcmp(tok, "TTY")) {
+        ASSERT(tok = strtok(NULL, delim));
+        uint16_t len_bytes = atoi(tok);
+        ASSERT(tok = strtok(NULL, delim));
+        const char *dev = tok;
+        ASSERT(NULL == (tok = strtok(NULL, delim)));
+        return open_tty(len_bytes, dev);
+    }
+
     ERROR("unknown type %s\n", tok);
 }
 

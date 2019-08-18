@@ -10,9 +10,18 @@ br0() {
 	brctl addif br0 tap0
 	wait
 }
+
 proxy() {
 	killall udpbridge.elf
 	($ELF UDP-CONNECT:172.30.3.222:1234 UDP-LISTEN:1234)&
+	wait
+}
+
+tap1() {
+	killall udpbridge.elf
+	($ELF UDP:hatd-win10:1234 TAP:tap1)&
+        sleep .1
+        ifconfig tap1 up
 	wait
 }
 
