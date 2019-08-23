@@ -68,6 +68,7 @@ typedef ssize_t (*port_read)(struct port *, uint8_t *, ssize_t);
 typedef ssize_t (*port_write)(struct port *, uint8_t *, ssize_t);
 struct port {
     int fd;
+    int fd_out;
     port_read read;
     port_write write;
 };
@@ -92,6 +93,7 @@ static inline struct port *open_tap(const char *dev) {
     struct port *port;
     ASSERT(port = malloc(sizeof(*port)));
     port->fd = fd;
+    port->fd_out = fd;
     port->read = tap_read;
     port->write = tap_write;
     return port;
@@ -167,6 +169,7 @@ static inline struct port *open_udp(uint16_t port) {
     ASSERT(p = malloc(sizeof(*p)));
     memset(p,0,sizeof(*p));
     p->p.fd = fd;
+    p->p.fd_out = fd;
     p->p.read  = (port_read)udp_read;
     p->p.write = (port_write)udp_write;
 
@@ -248,20 +251,23 @@ static ssize_t stream_read(struct stream_port *p, uint8_t *buf, ssize_t len) {
     return stream_pop(p, buf, len);
 }
 static ssize_t stream_write(struct stream_port *p, uint8_t *buf, ssize_t len) {
+    int fd = p->p.fd_out;
+
     //LOG("stream_write %d\n", len);
     uint8_t size[p->len_bytes];
     stream_packet_write_size(p, len, &size[0]);
     // FIXME: this might not be properly buffered..
-    ASSERT(p->len_bytes == write(p->p.fd, &size[0], p->len_bytes));
-    ASSERT(len          == write(p->p.fd, buf, len));
+    ASSERT(p->len_bytes == write(fd, &size[0], p->len_bytes));
+    ASSERT(len          == write(fd, buf, len));
     //LOG("stream_write %d (done)\n", len);
     return len + p->len_bytes;
 }
-static inline struct port *open_stream(uint32_t len_bytes, int fd) {
+static inline struct port *open_stream(uint32_t len_bytes, int fd, int fd_out) {
     struct stream_port *p;
     ASSERT(p = malloc(sizeof(*p)));
     memset(p,0,sizeof(*p));
     p->p.fd = fd;
+    p->p.fd_out = fd_out;
     p->p.read  = (port_read)stream_read;
     p->p.write = (port_write)stream_write;
     p->len_bytes = len_bytes;
@@ -284,7 +290,7 @@ static inline struct port *open_tty(uint32_t len_bytes, const char *dev) {
 
     ASSERT(0 == ioctl(fd, TCSETS2, &tio));
 
-    return open_stream(len_bytes, fd);
+    return open_stream(len_bytes, fd, fd);
 }
 
 #endif
@@ -316,7 +322,7 @@ static inline void proxy(struct port **port) {
                     //log_packet(buf, rlen);
 
                     out->write(out, buf, rlen);
-                    LOG("\r%c (%d)", progress[count % 4], count);
+                    //LOG("\r%c (%d)", progress[count % 4], count);
                     count++;
                 }
                 else {
@@ -428,6 +434,13 @@ struct port *from_portspec(char *spec) {
         const char *dev = tok;
         ASSERT(NULL == (tok = strtok(NULL, delim)));
         return open_tty(len_bytes, dev);
+    }
+
+    if (!strcmp(tok, "-")) {
+        ASSERT(tok = strtok(NULL, delim));
+        uint16_t len_bytes = atoi(tok);
+        ASSERT(NULL == (tok = strtok(NULL, delim)));
+        return open_stream(len_bytes, 0, 1);
     }
 
     ERROR("unknown type %s\n", tok);
