@@ -209,22 +209,39 @@ uint32_t stream_packet_write_size(struct stream_port *p, uint32_t size, uint8_t 
 }
 
 static ssize_t stream_pop(struct stream_port *p, uint8_t *buf, ssize_t len) {
-    if (p->count < p->len_bytes) return 0; // no size header
+    /* Make sure there are enough bytes to get the size field. */
+    if (p->count < p->len_bytes) return 0;
     uint32_t size = stream_packet_size(p);
+
+    /* Packets are assumed to fit in the buffer.  An error here is
+     * likely a bug or a protocol {packet,N} framing error. */
     if (sizeof(p->buf) < p->len_bytes + size) {
-        /* Keep buffer small as this is intended for Ethernet.  It
-         * will cause early failure for bad protocol data. */
         ERROR("buffer overflow for stream packet size=%d\n", size);
     }
-    if (p->count < p->len_bytes + size) return 0; // not complete
+
+    /* Ensure packet is complete and fits in output buffer before
+     * copying.  Skip the size prefix, which is used only for stream
+     * transport framing. */
+    if (p->count < p->len_bytes + size) return 0;
     ASSERT(size <= len);
     memcpy(buf, &p->buf[p->len_bytes], size);
-    ssize_t tail_count = p->count - (p->len_bytes + size);
-    if (tail_count) {
-        memmove(&p->buf[0], &p->buf[p->count], tail_count);
+    //LOG("copied %d:\n", size);
+    //log_packet(buf, size);
+
+
+    /* If there is anything residue, move it to the front. */
+    if (p->count == p->len_bytes+size) {
+        p->count = 0;
     }
-    p->count = tail_count;
-    LOG("pop: %d %d\n", size, p->count);
+    else {
+        ssize_t head_count = p->len_bytes + size;
+        ssize_t tail_count = p->count - head_count;
+        memmove(&p->buf[0], &p->buf[head_count], tail_count);
+        //LOG("moved %d %d:\n", p->count, tail_count);
+        //log_packet(&p->buf[0],tail_count);
+        p->count = tail_count;
+    }
+    //LOG("pop: %d %d\n", size, p->count);
     return size;
 }
 static ssize_t stream_read(struct stream_port *p, uint8_t *buf, ssize_t len) {
@@ -232,12 +249,13 @@ static ssize_t stream_read(struct stream_port *p, uint8_t *buf, ssize_t len) {
     /* If we still have a packet, return that first. */
     if ((size = stream_pop(p, buf, len))) return size;
 
-
-
-    /* We get only one read, so make it count. */
+    /* We get only one read() call, so make it count. */
     uint32_t room = sizeof(p->buf) - p->count;
-    //LOG("stream_read\n");
+    //LOG("stream_read %d\n", p->count);
     ssize_t rv = read(p->p.fd, &p->buf[p->count], room);
+    if (rv > 0) {
+        //log_packet(&p->buf[p->count], rv);
+    }
     //LOG("stream_read done %d\n", rv);
     if (rv == -1) {
         switch (errno) {
@@ -247,18 +265,31 @@ static ssize_t stream_read(struct stream_port *p, uint8_t *buf, ssize_t len) {
             ASSERT_ERRNO(-1);
         }
     }
+    if (rv == 0) {
+        ERROR("eof");
+    }
+    ASSERT(rv > 0);
     p->count += rv;
     return stream_pop(p, buf, len);
 }
+static void assert_write(int fd, uint8_t *buf, uint32_t len) {
+    uint32_t written = 0;
+    while(written < len) {
+        int rv;
+        ASSERT((rv = write(fd, buf, len)) > 0);
+        written += rv;
+    }
+}
+
+
 static ssize_t stream_write(struct stream_port *p, uint8_t *buf, ssize_t len) {
     int fd = p->p.fd_out;
 
     //LOG("stream_write %d\n", len);
     uint8_t size[p->len_bytes];
     stream_packet_write_size(p, len, &size[0]);
-    // FIXME: this might not be properly buffered..
-    ASSERT(p->len_bytes == write(fd, &size[0], p->len_bytes));
-    ASSERT(len          == write(fd, buf, len));
+    assert_write(fd, &size[0], p->len_bytes);
+    assert_write(fd, buf, len);
     //LOG("stream_write %d (done)\n", len);
     return len + p->len_bytes;
 }
