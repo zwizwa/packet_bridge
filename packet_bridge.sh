@@ -1,9 +1,9 @@
 #!/bin/bash
 
-ELF=$(dirname $0)/udpbridge.elf
+ELF=$(dirname $0)/packet_bridge.elf
 
 br0() {
-	killall udpbridge.elf
+	killall packet_bridge.elf
 	($ELF TAP:tap0 UDP-LISTEN:1234)&
 	sleep .1
 	ifconfig tap0 up
@@ -12,13 +12,13 @@ br0() {
 }
 
 proxy() {
-	killall udpbridge.elf
+	killall packet_bridge.elf
 	($ELF UDP-CONNECT:172.30.3.222:1234 UDP-LISTEN:1234)&
 	wait
 }
 
 tap1() {
-	killall udpbridge.elf
+	killall packet_bridge.elf
 	($ELF UDP:hatd-win10:1234 TAP:tap1)&
         sleep .1
         ifconfig tap1 up
@@ -28,7 +28,7 @@ tap1() {
 
 # Crude but simple test
 test() {
-	killall udpbridge.elf
+	killall packet_bridge.elf
 
 	($ELF TAP:tap0 UDP-LISTEN:1234) &
 	sleep .1

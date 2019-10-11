@@ -2,7 +2,8 @@
 if [ ! -z "REDO_VERBOSE_ENTER" ]; then 
     echo "redo: Entering directory '$(readlink -f .)'" >&2
 fi
-redo-ifchange $2.c
+H="packet_bridge.h"
+redo-ifchange $2.c $H
 #CFLAGS="-std=c99 -Wall -Werror"
 CFLAGS="-std=c99"
-gcc $CFLAGS -o $3 $2.c
+gcc $CFLAGS -o $3 -c $2.c

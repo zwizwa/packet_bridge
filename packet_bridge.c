@@ -1,13 +1,23 @@
-/* This is a testing tool.  Don't shoot yourself in the foot.
+/* Bridge two packet-based interfaces.
+   E.g. works like socat, but for UDP, TAP, SLIP stream, {packet,4} stream, ...
+*/
 
-   For ease of configuration, UDP packets are sent to the first peer
-   that sends a message to a listening socket and ignored afterwards.
-   If you know the UDP address, you can essentially gain unrestricted
-   raw Ethernet access to whatever the tap interface is bridged to.
+/*
+   Note that this is a testing tool that should probably not be
+   operated on a non-trusted network.  Don't shoot yourself in the
+   foot, because security measures are minimal.
+
+   For ease of configuration, UDP packets are returned to the first
+   peer that sends a message to a listening socket and all other peers
+   are ignored afterwards.  E.g. if you bridge TAP and UDP and know
+   the UDP address, you can essentially gain unrestricted raw Ethernet
+   access to whatever the tap interface is bridged to.
 */
 
 
-#include "system.h"
+#include "packet_bridge.h"
+
+#include "macros.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -40,6 +50,9 @@
 #include <asm-generic/ioctls.h>
 
 
+/***** 1. PACKET INTERFACES */
+
+
 // https://stackoverflow.com/questions/1003684/how-to-interface-with-the-linux-tun-driver
 // https://www.kernel.org/doc/Documentation/networking/tuntap.txt
 // https://wiki.wireshark.org/Development/LibpcapFileFormat
@@ -62,23 +75,13 @@ static void log_addr(struct sockaddr_in *sa) {
 }
 
 
-// Sockets and taps are different, so wrap behind interface.
-struct port;
-typedef ssize_t (*port_read)(struct port *, uint8_t *, ssize_t);
-typedef ssize_t (*port_write)(struct port *, uint8_t *, ssize_t);
-struct port {
-    int fd;
-    int fd_out;
-    port_read read;
-    port_write write;
-};
 
 static ssize_t tap_read(struct port *p, uint8_t *buf, ssize_t len) {
     ssize_t rlen;
     ASSERT_ERRNO(rlen = read(p->fd, buf, len));
     return rlen;
 }
-static ssize_t tap_write(struct port *p, uint8_t *buf, ssize_t len) {
+static ssize_t tap_write(struct port *p, const uint8_t *buf, ssize_t len) {
     // EIO is normal until iface is set up
     return write(p->fd, buf, len);
 }
@@ -170,8 +173,8 @@ static inline struct port *open_udp(uint16_t port) {
     memset(p,0,sizeof(*p));
     p->p.fd = fd;
     p->p.fd_out = fd;
-    p->p.read  = (port_read)udp_read;
-    p->p.write = (port_write)udp_write;
+    p->p.read  = (port_read_t)udp_read;
+    p->p.write = (port_write_t)udp_write;
 
     return &p->p;
 }
@@ -299,8 +302,8 @@ static inline struct port *open_stream(uint32_t len_bytes, int fd, int fd_out) {
     memset(p,0,sizeof(*p));
     p->p.fd = fd;
     p->p.fd_out = fd_out;
-    p->p.read  = (port_read)stream_read;
-    p->p.write = (port_write)stream_write;
+    p->p.read  = (port_read_t)stream_read;
+    p->p.write = (port_write_t)stream_write;
     p->len_bytes = len_bytes;
     return &p->p;
 }
@@ -326,9 +329,14 @@ static inline struct port *open_tty(uint32_t len_bytes, const char *dev) {
 
 #endif
 
+/***** 2. PROCESSING */
 
+// Default behavior is to just forward a packet.
+void packet_bridge_forward(void *no_context, struct port *out, const uint8_t *buf, ssize_t len) {
+    out->write(out, buf, len);
+}
 
-static inline void proxy(struct port **port) {
+static void proxy(struct port_forward_method *fw, struct port **port) {
     const char progress[] = "-\\|/";
     uint32_t count = 0;
 
@@ -338,7 +346,7 @@ static inline void proxy(struct port **port) {
         pfd[i].events = POLLERR | POLLIN;
     }
     for(;;) {
-        uint8_t buf[4096];
+        uint8_t buf[4096]; // FIXME: Make this configurable
         int rv;
         ASSERT_ERRNO(rv = poll(&pfd[0], 2, -1));
         ASSERT(rv >= 0);
@@ -352,7 +360,9 @@ static inline void proxy(struct port **port) {
                     //LOG("%d: %d\n", i, rlen);
                     //log_packet(buf, rlen);
 
-                    out->write(out, buf, rlen);
+                    // out->write(out, buf, rlen);
+                    fw[i].forward(fw[i].object, out, buf, rlen);
+
                     //LOG("\r%c (%d)", progress[count % 4], count);
                     count++;
                 }
@@ -405,6 +415,10 @@ static inline void proxy(struct port **port) {
    - monitor connection, if it goes down tear down old and rebuild
 
 */
+
+
+/***** 3. INSTANTIATION */
+
 
 struct port *from_portspec(char *spec) {
     const char delim[] = ":";
@@ -477,11 +491,10 @@ struct port *from_portspec(char *spec) {
     ERROR("unknown type %s\n", tok);
 }
 
-
-int main(int argc, char **argv) {
+int packet_bridge_main(struct port_forward_method *forward, int argc, char **argv) {
     ASSERT(argc > 2);
-    struct port *port[2];
-    ASSERT(port[0] = from_portspec(argv[1]));
-    ASSERT(port[1] = from_portspec(argv[2]));
-    proxy(port);
+    struct port *ports[2];
+    ASSERT(ports[0] = from_portspec(argv[1]));
+    ASSERT(ports[1] = from_portspec(argv[2]));
+    proxy(forward, ports);
 }
