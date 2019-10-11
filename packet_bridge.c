@@ -14,6 +14,7 @@
    access to whatever the tap interface is bridged to.
 */
 
+#define _POSIX_C_SOURCE 1
 
 #include "packet_bridge.h"
 
@@ -74,7 +75,18 @@ static void log_addr(struct sockaddr_in *sa) {
     LOG("%d\n", ntohs(sa->sin_port));
 }
 
+static void assert_write(int fd, uint8_t *buf, uint32_t len) {
+    uint32_t written = 0;
+    while(written < len) {
+        int rv;
+        ASSERT((rv = write(fd, buf, len)) > 0);
+        written += rv;
+    }
+}
 
+
+
+/***** 1.1. TAP */
 
 static ssize_t tap_read(struct port *p, uint8_t *buf, ssize_t len) {
     ssize_t rlen;
@@ -101,6 +113,9 @@ static inline struct port *open_tap(const char *dev) {
     port->write = tap_write;
     return port;
 }
+
+
+/***** 1.2. UDP */
 
 struct udp_port {
     struct port p;
@@ -179,87 +194,38 @@ static inline struct port *open_udp(uint16_t port) {
     return &p->p;
 }
 
+
+/***** 1.3. PACKETN */
+
 #if 1  // needs testing
 
 /* For byte streams, some kind of framing is necessary, so use Erlang
  * {packet,N} where every packet is prefixed with a big endian short
  * unsigned int with packet length. */
 
-struct stream_port {
+/* The read method can be shared, parameterized by a protocol-specific
+ * "pop" method that attempts to read a packet from the buffer. */
+
+struct buf_port {
     struct port p;
     uint32_t count;
-    uint32_t len_bytes;
     uint8_t buf[2048];
 };
-
-uint32_t stream_packet_size(struct stream_port *p) {
-    ASSERT(p->len_bytes <= 4);
-    ASSERT(p->count >= p->len_bytes);
-    uint32_t size = 0;
-    for (uint32_t i=0; i<p->len_bytes; i++) {
-        size = (size << 8) + p->buf[i];
-    }
-    //LOG("size %d\n", size);
-    return size;
-}
-uint32_t stream_packet_write_size(struct stream_port *p, uint32_t size, uint8_t *buf) {
-    ASSERT(p->len_bytes <= 4);
-    for (uint32_t i=0; i<p->len_bytes; i++) {
-        buf[p->len_bytes-1-i] = size & 0xFF;
-        size = size >> 8;
-    }
-    return size;
-}
-
-static ssize_t stream_pop(struct stream_port *p, uint8_t *buf, ssize_t len) {
-    /* Make sure there are enough bytes to get the size field. */
-    if (p->count < p->len_bytes) return 0;
-    uint32_t size = stream_packet_size(p);
-
-    /* Packets are assumed to fit in the buffer.  An error here is
-     * likely a bug or a protocol {packet,N} framing error. */
-    if (sizeof(p->buf) < p->len_bytes + size) {
-        ERROR("buffer overflow for stream packet size=%d\n", size);
-    }
-
-    /* Ensure packet is complete and fits in output buffer before
-     * copying.  Skip the size prefix, which is used only for stream
-     * transport framing. */
-    if (p->count < p->len_bytes + size) return 0;
-    ASSERT(size <= len);
-    memcpy(buf, &p->buf[p->len_bytes], size);
-    //LOG("copied %d:\n", size);
-    //log_packet(buf, size);
-
-
-    /* If there is anything residue, move it to the front. */
-    if (p->count == p->len_bytes+size) {
-        p->count = 0;
-    }
-    else {
-        ssize_t head_count = p->len_bytes + size;
-        ssize_t tail_count = p->count - head_count;
-        memmove(&p->buf[0], &p->buf[head_count], tail_count);
-        //LOG("moved %d %d:\n", p->count, tail_count);
-        //log_packet(&p->buf[0],tail_count);
-        p->count = tail_count;
-    }
-    //LOG("pop: %d %d\n", size, p->count);
-    return size;
-}
-static ssize_t stream_read(struct stream_port *p, uint8_t *buf, ssize_t len) {
+typedef ssize_t (*packet_pop_t)(struct buf_port *p, uint8_t *buf, ssize_t len);
+static ssize_t pop_read(packet_pop_t pop,
+                        struct buf_port *p, uint8_t *buf, ssize_t len) {
     ssize_t size;
     /* If we still have a packet, return that first. */
-    if ((size = stream_pop(p, buf, len))) return size;
+    if ((size = pop(p, buf, len))) return size;
 
     /* We get only one read() call, so make it count. */
     uint32_t room = sizeof(p->buf) - p->count;
-    //LOG("stream_read %d\n", p->count);
+    //LOG("packetn_read %d\n", p->count);
     ssize_t rv = read(p->p.fd, &p->buf[p->count], room);
     if (rv > 0) {
         //log_packet(&p->buf[p->count], rv);
     }
-    //LOG("stream_read done %d\n", rv);
+    //LOG("packetn_read done %d\n", rv);
     if (rv == -1) {
         switch (errno) {
         case EAGAIN:
@@ -273,41 +239,99 @@ static ssize_t stream_read(struct stream_port *p, uint8_t *buf, ssize_t len) {
     }
     ASSERT(rv > 0);
     p->count += rv;
-    return stream_pop(p, buf, len);
+    return pop(p, buf, len);
 }
-static void assert_write(int fd, uint8_t *buf, uint32_t len) {
-    uint32_t written = 0;
-    while(written < len) {
-        int rv;
-        ASSERT((rv = write(fd, buf, len)) > 0);
-        written += rv;
+
+
+
+struct packetn_port {
+    struct buf_port p;
+    uint32_t len_bytes;
+};
+
+uint32_t packetn_packet_size(struct packetn_port *p) {
+    ASSERT(p->len_bytes <= 4);
+    ASSERT(p->p.count >= p->len_bytes);
+    uint32_t size = 0;
+    for (uint32_t i=0; i<p->len_bytes; i++) {
+        size = (size << 8) + p->p.buf[i];
     }
+    //LOG("size %d\n", size);
+    return size;
+}
+uint32_t packetn_packet_write_size(struct packetn_port *p, uint32_t size, uint8_t *buf) {
+    ASSERT(p->len_bytes <= 4);
+    for (uint32_t i=0; i<p->len_bytes; i++) {
+        buf[p->len_bytes-1-i] = size & 0xFF;
+        size = size >> 8;
+    }
+    return size;
 }
 
+static ssize_t packetn_pop(struct packetn_port *p, uint8_t *buf, ssize_t len) {
+    /* Make sure there are enough bytes to get the size field. */
+    if (p->p.count < p->len_bytes) return 0;
+    uint32_t size = packetn_packet_size(p);
 
-static ssize_t stream_write(struct stream_port *p, uint8_t *buf, ssize_t len) {
-    int fd = p->p.fd_out;
+    /* Packets are assumed to fit in the buffer.  An error here is
+     * likely a bug or a protocol {packet,N} framing error. */
+    if (sizeof(p->p.buf) < p->len_bytes + size) {
+        ERROR("buffer overflow for stream packet size=%d\n", size);
+    }
 
-    //LOG("stream_write %d\n", len);
+    /* Ensure packet is complete and fits in output buffer before
+     * copying.  Skip the size prefix, which is used only for stream
+     * transport framing. */
+    if (p->p.count < p->len_bytes + size) return 0;
+    ASSERT(size <= len);
+    memcpy(buf, &p->p.buf[p->len_bytes], size);
+    //LOG("copied %d:\n", size);
+    //log_packet(buf, size);
+
+
+    /* If there is anything residue, move it to the front. */
+    if (p->p.count == p->len_bytes+size) {
+        p->p.count = 0;
+    }
+    else {
+        ssize_t head_count = p->len_bytes + size;
+        ssize_t tail_count = p->p.count - head_count;
+        memmove(&p->p.buf[0], &p->p.buf[head_count], tail_count);
+        //LOG("moved %d %d:\n", p->count, tail_count);
+        //log_packet(&p->buf[0],tail_count);
+        p->p.count = tail_count;
+    }
+    //LOG("pop: %d %d\n", size, p->count);
+    return size;
+}
+
+static ssize_t packetn_read(struct packetn_port *p, uint8_t *buf, ssize_t len) {
+    return pop_read((packet_pop_t)packetn_pop, &p->p, buf, len);
+}
+
+static ssize_t packetn_write(struct packetn_port *p, uint8_t *buf, ssize_t len) {
+    int fd = p->p.p.fd_out;
+
+    //LOG("packetn_write %d\n", len);
     uint8_t size[p->len_bytes];
-    stream_packet_write_size(p, len, &size[0]);
+    packetn_packet_write_size(p, len, &size[0]);
     assert_write(fd, &size[0], p->len_bytes);
     assert_write(fd, buf, len);
-    //LOG("stream_write %d (done)\n", len);
+    //LOG("packetn_write %d (done)\n", len);
     return len + p->len_bytes;
 }
-static inline struct port *open_stream(uint32_t len_bytes, int fd, int fd_out) {
-    struct stream_port *p;
+static inline struct port *open_packetn_stream(uint32_t len_bytes, int fd, int fd_out) {
+    struct packetn_port *p;
     ASSERT(p = malloc(sizeof(*p)));
     memset(p,0,sizeof(*p));
-    p->p.fd = fd;
-    p->p.fd_out = fd_out;
-    p->p.read  = (port_read_t)stream_read;
-    p->p.write = (port_write_t)stream_write;
+    p->p.p.fd = fd;
+    p->p.p.fd_out = fd_out;
+    p->p.p.read  = (port_read_t)packetn_read;
+    p->p.p.write = (port_write_t)packetn_write;
     p->len_bytes = len_bytes;
-    return &p->p;
+    return &p->p.p;
 }
-static inline struct port *open_tty(uint32_t len_bytes, const char *dev) {
+static inline struct port *open_packetn_tty(uint32_t len_bytes, const char *dev) {
     int fd;
     ASSERT_ERRNO(fd = open(dev, O_RDWR | O_NONBLOCK));
 
@@ -324,17 +348,239 @@ static inline struct port *open_tty(uint32_t len_bytes, const char *dev) {
 
     ASSERT(0 == ioctl(fd, TCSETS2, &tio));
 
-    return open_stream(len_bytes, fd, fd);
+    return open_packetn_stream(len_bytes, fd, fd);
 }
 
 #endif
 
+
+
+/***** 1.4. SLIP */
+
+#if 1  // needs testing
+
+/* See https://en.wikipedia.org/wiki/Serial_Line_Internet_Protocol */
+#define SLIP_END     0xC0
+#define SLIP_ESC     0xDB
+#define SLIP_ESC_END 0xDC
+#define SLIP_ESC_ESC 0xDD
+
+/* For byte streams, some kind of framing is necessary, so use Erlang
+ * {packet,N} where every packet is prefixed with a big endian short
+ * unsigned int with packet length. */
+
+struct slip_port {
+    struct buf_port p;
+};
+
+/* Try to pop a frame.  If it's not complete, return 0.  p->buf
+ * contains slip-encoded data.  It is allowed to use the output buffer
+ * to perform partial decoding. */
+static ssize_t slip_pop(struct slip_port *p, uint8_t *buf, ssize_t len) {
+
+    // 1. Go over data and stop at packet boundary, writing partial
+    // data to output buffer.  Abort with 0 size when packet is
+    // incomplete.
+    ssize_t in = 0, out = 0;
+    for(;;) {
+        ASSERT(out < len);
+        if (in >= p->p.count) return 0;
+        uint8_t c = p->p.buf[in++];
+        if (SLIP_END == c) {
+            break;
+        }
+        else if (SLIP_ESC == c) {
+            if (in >= p->p.count) return 0;
+            uint8_t c = p->p.buf[in++];
+            if (SLIP_ESC_ESC == c) {
+                buf[out++] = SLIP_ESC;
+            }
+            else if (SLIP_ESC_END == c) {
+                buf[out++] = SLIP_END;
+            }
+            else {
+                ERROR("bad slip escape %d\n", (int)c);
+            }
+        }
+        else {
+            buf[out++] = c;
+        }
+    }
+
+    // 2. Shift the data buffer
+    memmove(&p->p.buf[0], &p->p.buf[in], p->p.count-in);
+    p->p.count -= in;
+
+    return out;
+}
+static ssize_t slip_read(struct packetn_port *p, uint8_t *buf, ssize_t len) {
+    return pop_read((packet_pop_t)slip_pop, &p->p, buf, len);
+}
+
+static ssize_t slip_write(struct slip_port *p, uint8_t *buf, ssize_t len) {
+    /* Use a temporary buffer to avoid multiple write() calls.  Worst
+     * case size is x2, when each character is escaped, plus 2 for
+     * double-ended delimiters. */
+    uint8_t tmp[len*2 + 2];
+
+    ssize_t out = 0;
+
+    /* Convention: write packet boundary at the beginning and the
+     * start.  Receiver needs to throw away empty (or otherwise
+     * invalid) packets. */
+    tmp[out++] = SLIP_END;
+    for(ssize_t in=0; in<len; in++) {
+        int c_in = buf[in];
+        if (SLIP_END == c_in) {
+            tmp[out++] = SLIP_ESC;
+            tmp[out++] = SLIP_ESC_END;
+        }
+        else if (SLIP_ESC == c_in) {
+            tmp[out++] = SLIP_ESC;
+            tmp[out++] = SLIP_ESC_ESC;
+        }
+        else {
+            tmp[out++] = c_in;
+        }
+    }
+    tmp[out++] = SLIP_END;
+
+    assert_write(p->p.p.fd_out, buf, out);
+    return out;
+}
+static inline struct port *open_slip_stream(int fd, int fd_out) {
+    struct slip_port *p;
+    ASSERT(p = malloc(sizeof(*p)));
+    memset(p,0,sizeof(*p));
+    p->p.p.fd = fd;
+    p->p.p.fd_out = fd_out;
+    p->p.p.read  = (port_read_t)slip_read;
+    p->p.p.write = (port_write_t)slip_write;
+    return &p->p.p;
+}
+static inline struct port *open_slip_tty(const char *dev) {
+    int fd;
+    ASSERT_ERRNO(fd = open(dev, O_RDWR | O_NONBLOCK));
+
+    struct termios2 tio;
+    ASSERT(0 == ioctl(fd, TCGETS2, &tio));
+
+    // http://www.cs.uleth.ca/~holzmann/C/system/ttyraw.c
+    tio.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    tio.c_oflag &= ~(OPOST);
+    tio.c_cflag |= (CS8);
+    tio.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+    tio.c_cc[VMIN] = 1;
+    tio.c_cc[VTIME] = 0;
+
+    ASSERT(0 == ioctl(fd, TCSETS2, &tio));
+
+    return open_slip_stream(fd, fd);
+}
+
+#endif
+
+/***** 1.5. HEX */
+struct hex_port {
+    struct buf_port p;
+    FILE *f_out;
+};
+
+
+static int hexdigit(int c) {
+    if ((c >= '0') && (c <= '9')) {
+        return c - '0';
+    }
+    if ((c >= 'A') && (c <= 'F')) {
+        return c - 'A' + 10;
+    }
+    if ((c >= 'a') && (c <= 'f')) {
+        return c - 'a' + 10;
+    }
+    return -1;
+}
+
+
+static ssize_t hex_pop(struct hex_port *p, uint8_t *buf, ssize_t len) {
+
+    // 1. Go over data and stop at packet boundary, writing partial
+    // data to output buffer.  Abort with 0 size when packet is
+    // incomplete.
+    ssize_t in = 0, out = 0;
+    for(;;) {
+        ASSERT(out < len);
+
+        if (in >= p->p.count) return 0;
+        uint8_t c1 = p->p.buf[in++];
+
+        /* Check any control characters. */
+        if (c1 == '\n') {
+            /* Newline terminates. */
+            break;
+        };
+        if (c1 == ' ') {
+            /* Spaces are allowed inbetween hex bytes. */
+            continue;
+        }
+
+        /* The only legal case left is two valid hex digits. */
+        if (in >= p->p.count) return 0;
+        uint8_t c2 = p->p.buf[in++];
+
+        int d1, d2;
+        ASSERT(-1 != (d1 = hexdigit(c1)));
+        ASSERT(-1 != (d2 = hexdigit(c2)));
+
+        buf[out++] = (d1 << 4) + d2;
+    }
+
+    // 2. Shift the data buffer
+    memmove(&p->p.buf[0], &p->p.buf[in], p->p.count-in);
+    p->p.count -= in;
+
+    return out;
+}
+
+
+static ssize_t hex_read(struct hex_port *p, uint8_t *buf, ssize_t len) {
+    return pop_read((packet_pop_t)hex_pop, &p->p, buf, len);
+}
+static ssize_t hex_write(struct hex_port *p, uint8_t *buf, ssize_t len) {
+    ssize_t out = 0;
+    for (ssize_t i=0; i<len; i++) { out += fprintf(p->f_out, " %02x", buf[i]); }
+    out += fprintf(p->f_out, "\n");
+    fflush(p->f_out);
+    return out;
+}
+static inline struct port *open_hex_stream(int fd, int fd_out) {
+    struct hex_port *p;
+    ASSERT(p = malloc(sizeof(*p)));
+    memset(p,0,sizeof(*p));
+    p->p.p.fd = fd;
+    p->p.p.fd_out = fd_out;
+    p->p.p.read  = (port_read_t)hex_read;
+    p->p.p.write = (port_write_t)hex_write;
+    p->f_out = fdopen(fd_out, "w");
+    return &p->p.p;
+}
+
+
+
+
 /***** 2. PROCESSING */
 
-// Default behavior is to just forward a packet.
+/* Default behavior is to just forward a packet.  Leave any other
+ * processing behavior to application code. */
 void packet_bridge_forward(void *no_context, struct port *out, const uint8_t *buf, ssize_t len) {
     out->write(out, buf, len);
 }
+
+
+
+
+
+
+/***** 3. FRAMEWORK */
 
 static void proxy(struct port_forward_method *fw, struct port **port) {
     const char progress[] = "-\\|/";
@@ -373,52 +619,6 @@ static void proxy(struct port_forward_method *fw, struct port **port) {
         }
     }
 }
-
-
-/* To set up UDP someone needs to send a first packet.  All other
-   packets will go back to the first peer.  These are the
-   configurations:
-
-   udp2udp <port1> <port2> [<dst_host> <dst_port>]
-
-   tap2udp <tap>   <port>  [<dst_host> <dst_port>]
-
-   dst_host, dst_port are optional.  If present, a first packet is
-   sent to initate communication.
-
-   It seems that will solve all topologies.
-
-   EDIT: I need to think about this some more.  Problem is that I
-   don't understand UDP very well, i.e.: how can I let the OS pick a
-   port?  Because in the a-symmetric situation, I want one listening
-   port that is well known, but the other port can be arbitrary since
-   it will be chained to the next hop, and that one will reply to any
-   port that is specified.  I think I get it now, just figure out how
-   to do this.  I guess this just boils down to binding or not.
-
-   So what about this: add L: or C: prefixes to set up the initial
-   direction of the socket.
-
-   Follow socat suntax:
-
-   TAP:tap0
-   UDP4-LISTEN:port
-   UDP4:host:port
-
-
-   Setup:
-   - ssh to the endpoint, start udp-listen A + tap
-   - ssh to the midpont,  start udp-listen B + udp-connect to A
-   - .. other midpoints ..
-   - local: start tap + udp-connect to B
-   - gather all pids doing so and close ssh connections
-   - monitor connection, if it goes down tear down old and rebuild
-
-*/
-
-
-/***** 3. INSTANTIATION */
-
 
 struct port *from_portspec(char *spec) {
     const char delim[] = ":";
@@ -474,19 +674,39 @@ struct port *from_portspec(char *spec) {
 
     if (!strcmp(tok, "TTY")) {
         ASSERT(tok = strtok(NULL, delim));
-        uint16_t len_bytes = atoi(tok);
-        ASSERT(tok = strtok(NULL, delim));
-        const char *dev = tok;
-        ASSERT(NULL == (tok = strtok(NULL, delim)));
-        return open_tty(len_bytes, dev);
+        if (!strcmp("slip", tok)) {
+            const char *dev = tok;
+            ASSERT(NULL == (tok = strtok(NULL, delim)));
+            return open_slip_tty(dev);
+        }
+        else {
+            uint16_t len_bytes = atoi(tok);
+            ASSERT(tok = strtok(NULL, delim));
+            const char *dev = tok;
+            ASSERT(NULL == (tok = strtok(NULL, delim)));
+            return open_packetn_tty(len_bytes, dev);
+        }
     }
 
     if (!strcmp(tok, "-")) {
         ASSERT(tok = strtok(NULL, delim));
-        uint16_t len_bytes = atoi(tok);
-        ASSERT(NULL == (tok = strtok(NULL, delim)));
-        return open_stream(len_bytes, 0, 1);
+        if (!strcmp("slip", tok)) {
+            ASSERT(NULL == (tok = strtok(NULL, delim)));
+            return open_slip_stream(0, 1);
+        }
+        else {
+            uint16_t len_bytes = atoi(tok);
+            ASSERT(NULL == (tok = strtok(NULL, delim)));
+            return open_packetn_stream(len_bytes, 0, 1);
+        }
     }
+
+    if (!strcmp(tok, "HEX")) {
+        ASSERT(NULL == (tok = strtok(NULL, delim)));
+        return open_hex_stream(0, 1);
+    }
+
+    // FIXME: debug hex output/input
 
     ERROR("unknown type %s\n", tok);
 }
@@ -498,3 +718,50 @@ int packet_bridge_main(struct port_forward_method *forward, int argc, char **arg
     ASSERT(ports[1] = from_portspec(argv[2]));
     proxy(forward, ports);
 }
+
+
+
+/* To set up UDP someone needs to send a first packet.  All other
+   packets will go back to the first peer.  These are the
+   configurations:
+
+   udp2udp <port1> <port2> [<dst_host> <dst_port>]
+
+   tap2udp <tap>   <port>  [<dst_host> <dst_port>]
+
+   dst_host, dst_port are optional.  If present, a first packet is
+   sent to initate communication.
+
+   It seems that will solve all topologies.
+
+   EDIT: I need to think about this some more.  Problem is that I
+   don't understand UDP very well, i.e.: how can I let the OS pick a
+   port?  Because in the a-symmetric situation, I want one listening
+   port that is well known, but the other port can be arbitrary since
+   it will be chained to the next hop, and that one will reply to any
+   port that is specified.  I think I get it now, just figure out how
+   to do this.  I guess this just boils down to binding or not.
+
+   So what about this: add L: or C: prefixes to set up the initial
+   direction of the socket.
+
+   Follow socat suntax:
+
+   TAP:tap0
+   UDP4-LISTEN:port
+   UDP4:host:port
+
+
+   Setup:
+   - ssh to the endpoint, start udp-listen A + tap
+   - ssh to the midpont,  start udp-listen B + udp-connect to A
+   - .. other midpoints ..
+   - local: start tap + udp-connect to B
+   - gather all pids doing so and close ssh connections
+   - monitor connection, if it goes down tear down old and rebuild
+
+*/
+
+
+
+
