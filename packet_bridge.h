@@ -17,16 +17,21 @@ struct port {
 
 
 // Processing functions
-// We don't provide processing here, just forwarding.
-typedef void (*port_forward_t)(void *, struct port *, const uint8_t *, ssize_t);
-void packet_bridge_forward(void * no_context, struct port *out, const uint8_t *buf, ssize_t len);
-struct port_forward_method {
-    void *object;
-    port_forward_t forward;
+struct port_forward_ctx {
+    int nb_ports;
+    struct port **port;
 };
+typedef void (*port_forward_t)(struct port_forward_ctx *, int from, const uint8_t *, ssize_t);
+// We don't provide processing here, just forwarding.
+void packet_bridge_forward(struct port_forward_ctx *, int from, const uint8_t *buf, ssize_t len);
 
-// Instantiation
-int packet_bridge_main(struct port_forward_method *forward, int argc, char **argv);
+void packet_bridge_loop(port_forward_t forward,
+                        struct port_forward_ctx *ctx);
+
+
+// Default instantiation.
+// For derivative applications, see this function's implementation.
+int packet_bridge_forward_main(int argc, char **argv);
 
 
 #endif

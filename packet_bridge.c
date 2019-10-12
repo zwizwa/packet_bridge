@@ -488,15 +488,9 @@ struct hex_port {
 
 
 static int hexdigit(int c) {
-    if ((c >= '0') && (c <= '9')) {
-        return c - '0';
-    }
-    if ((c >= 'A') && (c <= 'F')) {
-        return c - 'A' + 10;
-    }
-    if ((c >= 'a') && (c <= 'f')) {
-        return c - 'a' + 10;
-    }
+    if ((c >= '0') && (c <= '9')) return c - '0';
+    if ((c >= 'A') && (c <= 'F')) return c - 'A' + 10;
+    if ((c >= 'a') && (c <= 'f')) return c - 'a' + 10;
     return -1;
 }
 
@@ -569,10 +563,13 @@ static inline struct port *open_hex_stream(int fd, int fd_out) {
 
 /***** 2. PROCESSING */
 
-/* Default behavior is to just forward a packet.  Leave any other
- * processing behavior to application code. */
-void packet_bridge_forward(void *no_context, struct port *out, const uint8_t *buf, ssize_t len) {
-    out->write(out, buf, len);
+/* Default behavior for the stand-alone program is to just forward a
+ * packet to the other port.  Any other processing behavior is left to
+ * application code that uses packet_bridge as a library.. */
+
+void packet_bridge_forward(struct port_forward_ctx *x, int from, const uint8_t *buf, ssize_t len) {
+    int to = (from == 0) ? 1 : 0;
+    x->port[to]->write(x->port[to], buf, len);
 }
 
 
@@ -582,13 +579,16 @@ void packet_bridge_forward(void *no_context, struct port *out, const uint8_t *bu
 
 /***** 3. FRAMEWORK */
 
-static void proxy(struct port_forward_method *fw, struct port **port) {
+void packet_bridge_loop(port_forward_t forward,
+                        struct port_forward_ctx *ctx) {
     const char progress[] = "-\\|/";
     uint32_t count = 0;
 
-    struct pollfd pfd[2] = {};
-    for (int i=0; i<2; i++) {
-        pfd[i].fd = port[i]->fd;
+    struct pollfd pfd[ctx->nb_ports];
+    memset(pfd, 0, sizeof(pfd));
+
+    for (int i=0; i<ctx->nb_ports; i++) {
+        pfd[i].fd = ctx->port[i]->fd;
         pfd[i].events = POLLERR | POLLIN;
     }
     for(;;) {
@@ -596,10 +596,9 @@ static void proxy(struct port_forward_method *fw, struct port **port) {
         int rv;
         ASSERT_ERRNO(rv = poll(&pfd[0], 2, -1));
         ASSERT(rv >= 0);
-        for (int i=0; i<2; i++) {
+        for (int i=0; i<ctx->nb_ports; i++) {
             if(pfd[i].revents & POLLIN) {
-                struct port *in  = port[i];
-                struct port *out = port[1-i];
+                struct port *in  = ctx->port[i];
 
                 int rlen = in->read(in, buf, sizeof(buf));
                 if (rlen) {
@@ -607,7 +606,7 @@ static void proxy(struct port_forward_method *fw, struct port **port) {
                     //log_packet(buf, rlen);
 
                     // out->write(out, buf, rlen);
-                    fw[i].forward(fw[i].object, out, buf, rlen);
+                    forward(ctx, i, buf, rlen);
 
                     //LOG("\r%c (%d)", progress[count % 4], count);
                     count++;
@@ -661,6 +660,8 @@ struct port *from_portspec(char *spec) {
         up->peer.sin_family = AF_INET;
 
         // FIXME: Send some meaningful ethernet packet instead
+        // FIXME: Make this optional?  Or require application to initiate?
+#if 0
         uint8_t buf[] = {
             0x55,0x55,0x55,0x55,0x55,0x55,
             0x55,0x55,0x55,0x55,0x55,0x55,
@@ -669,6 +670,9 @@ struct port *from_portspec(char *spec) {
         LOG("udp: hello to ");
         log_addr(&up->peer);
         ASSERT(sizeof(buf) == p->write(p, buf, sizeof(buf)));
+#else
+        LOG("udp: not sending hello\n");
+#endif
         return p;
     }
 
@@ -711,12 +715,16 @@ struct port *from_portspec(char *spec) {
     ERROR("unknown type %s\n", tok);
 }
 
-int packet_bridge_main(struct port_forward_method *forward, int argc, char **argv) {
+int packet_bridge_forward_main(int argc, char **argv) {
     ASSERT(argc > 2);
-    struct port *ports[2];
-    ASSERT(ports[0] = from_portspec(argv[1]));
-    ASSERT(ports[1] = from_portspec(argv[2]));
-    proxy(forward, ports);
+    struct port *port[2];
+    struct port_forward_ctx ctx = {
+        .nb_ports = 2,
+        .port = port
+    };
+    ASSERT(port[0] = from_portspec(argv[1]));
+    ASSERT(port[1] = from_portspec(argv[2]));
+    packet_bridge_loop(packet_bridge_forward, &ctx);
 }
 
 
