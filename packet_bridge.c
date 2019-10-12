@@ -211,7 +211,7 @@ struct port *port_open_udp(uint16_t port) {
 struct buf_port {
     struct port p;
     uint32_t count;
-    uint8_t buf[2048];
+    uint8_t buf[2*PACKET_MAX_SIZE];
 };
 static ssize_t pop_read(port_pop_fn pop,
                         struct buf_port *p, uint8_t *buf, ssize_t len) {
@@ -409,7 +409,7 @@ static ssize_t slip_pop(struct slip_port *p, uint8_t *buf, ssize_t len) {
         }
     }
 
-    LOG("slip_pop: "); log_hex(&p->p.buf[0], in);
+    //LOG("slip_pop: "); log_hex(&p->p.buf[0], in);
 
 
     // 2. Shift the data buffer
@@ -450,7 +450,7 @@ static ssize_t slip_write(struct slip_port *p, uint8_t *buf, ssize_t len) {
     }
     tmp[out++] = SLIP_END;
 
-    LOG("slip_write: "); log_hex(tmp, out);
+    //LOG("slip_write: "); log_hex(tmp, out);
 
     assert_write(p->p.p.fd_out, tmp, out);
     return out;
@@ -601,9 +601,9 @@ void packet_loop(packet_handle_fn handle,
         pfd[i].events = POLLERR | POLLIN;
     }
     for(;;) {
-        uint8_t buf[4096]; // FIXME: Make this configurable
+        uint8_t buf[PACKET_MAX_SIZE]; // FIXME: Make this configurable
         int rv;
-        ASSERT_ERRNO(rv = poll(&pfd[0], 2, -1));
+        ASSERT_ERRNO(rv = poll(&pfd[0], 2, ctx->timeout));
         ASSERT(rv >= 0);
         for (int i=0; i<ctx->nb_ports; i++) {
             if(pfd[i].revents & POLLIN) {
@@ -624,7 +624,7 @@ void packet_loop(packet_handle_fn handle,
                  * read method returned multiple packets, so we pop
                  * them one by one. */
                 if (in->pop) {
-                    while((rlen = in->pop(in, buf, sizeof(buf)))) {
+                    while((rlen = in->pop((struct buf_port *)in, buf, sizeof(buf)))) {
                         handle(ctx, i, buf, rlen);
                         count++;
                     }
@@ -740,7 +740,8 @@ int packet_forward_main(int argc, char **argv) {
     struct port *port[2];
     struct packet_handle_ctx ctx = {
         .nb_ports = 2,
-        .port = port
+        .port = port,
+        .timeout = -1 // infinity
     };
     ASSERT(port[0] = port_open(argv[1]));
     ASSERT(port[1] = port_open(argv[2]));

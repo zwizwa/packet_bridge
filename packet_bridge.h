@@ -33,6 +33,7 @@ struct port *port_open(const char *spec);
 struct packet_handle_ctx {
     int nb_ports;
     struct port **port;
+    int timeout;
 };
 typedef void (*packet_handle_fn)(struct packet_handle_ctx *, int src, const uint8_t *, ssize_t);
 void packet_loop(packet_handle_fn forward, struct packet_handle_ctx *ctx);
@@ -42,6 +43,10 @@ void packet_loop(packet_handle_fn forward, struct packet_handle_ctx *ctx);
 // simple forwarding between two packet ports.
 void packet_forward(struct packet_handle_ctx *, int from, const uint8_t *buf, ssize_t len);
 int packet_forward_main(int argc, char **argv);
+
+
+// FIXME: Don't make buffers static size.
+#define PACKET_MAX_SIZE 4096
 
 
 #endif
