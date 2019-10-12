@@ -58,7 +58,7 @@
 // https://www.kernel.org/doc/Documentation/networking/tuntap.txt
 // https://wiki.wireshark.org/Development/LibpcapFileFormat
 
-static inline void log_packet(uint8_t *buf, ssize_t n) {
+static inline void log_hex(uint8_t *buf, ssize_t n) {
     for(ssize_t i=0; i<n; i++) {
         LOG(" %02x", buf[i]);
         if (i%16 == 15) LOG("\n");
@@ -98,7 +98,7 @@ static ssize_t tap_write(struct port *p, const uint8_t *buf, ssize_t len) {
     return write(p->fd, buf, len);
 }
 
-struct port *open_tap(const char *dev) {
+struct port *port_open_tap(const char *dev) {
     int fd;
     ASSERT_ERRNO(fd = open("/dev/net/tun", O_RDWR));
     struct ifreq ifr = { .ifr_flags = IFF_TAP | IFF_NO_PI };
@@ -111,6 +111,7 @@ struct port *open_tap(const char *dev) {
     port->fd_out = fd;
     port->read = tap_read;
     port->write = tap_write;
+    port->pop = 0;
     return port;
 }
 
@@ -167,7 +168,7 @@ static ssize_t udp_write(struct udp_port *p, uint8_t *buf, ssize_t len) {
     return wlen;
 }
 
-struct port *open_udp(uint16_t port) {
+struct port *port_open_udp(uint16_t port) {
     int fd;
     ASSERT_ERRNO(fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
     if(port) {
@@ -190,6 +191,7 @@ struct port *open_udp(uint16_t port) {
     p->p.fd_out = fd;
     p->p.read  = (port_read_fn)udp_read;
     p->p.write = (port_write_fn)udp_write;
+    p->p.pop = 0;
 
     return &p->p;
 }
@@ -211,8 +213,7 @@ struct buf_port {
     uint32_t count;
     uint8_t buf[2048];
 };
-typedef ssize_t (*packet_pop_t)(struct buf_port *p, uint8_t *buf, ssize_t len);
-static ssize_t pop_read(packet_pop_t pop,
+static ssize_t pop_read(port_pop_fn pop,
                         struct buf_port *p, uint8_t *buf, ssize_t len) {
     ssize_t size;
     /* If we still have a packet, return that first. */
@@ -223,7 +224,7 @@ static ssize_t pop_read(packet_pop_t pop,
     //LOG("packetn_read %d\n", p->count);
     ssize_t rv = read(p->p.fd, &p->buf[p->count], room);
     if (rv > 0) {
-        //log_packet(&p->buf[p->count], rv);
+        //log_hex(&p->buf[p->count], rv);
     }
     //LOG("packetn_read done %d\n", rv);
     if (rv == -1) {
@@ -286,7 +287,7 @@ static ssize_t packetn_pop(struct packetn_port *p, uint8_t *buf, ssize_t len) {
     ASSERT(size <= len);
     memcpy(buf, &p->p.buf[p->len_bytes], size);
     //LOG("copied %d:\n", size);
-    //log_packet(buf, size);
+    //log_hex(buf, size);
 
 
     /* If there is anything residue, move it to the front. */
@@ -298,7 +299,7 @@ static ssize_t packetn_pop(struct packetn_port *p, uint8_t *buf, ssize_t len) {
         ssize_t tail_count = p->p.count - head_count;
         memmove(&p->p.buf[0], &p->p.buf[head_count], tail_count);
         //LOG("moved %d %d:\n", p->count, tail_count);
-        //log_packet(&p->buf[0],tail_count);
+        //log_hex(&p->buf[0],tail_count);
         p->p.count = tail_count;
     }
     //LOG("pop: %d %d\n", size, p->count);
@@ -306,7 +307,7 @@ static ssize_t packetn_pop(struct packetn_port *p, uint8_t *buf, ssize_t len) {
 }
 
 static ssize_t packetn_read(struct packetn_port *p, uint8_t *buf, ssize_t len) {
-    return pop_read((packet_pop_t)packetn_pop, &p->p, buf, len);
+    return pop_read((port_pop_fn)packetn_pop, &p->p, buf, len);
 }
 
 static ssize_t packetn_write(struct packetn_port *p, uint8_t *buf, ssize_t len) {
@@ -320,7 +321,7 @@ static ssize_t packetn_write(struct packetn_port *p, uint8_t *buf, ssize_t len) 
     //LOG("packetn_write %d (done)\n", len);
     return len + p->len_bytes;
 }
-struct port *open_packetn_stream(uint32_t len_bytes, int fd, int fd_out) {
+struct port *port_open_packetn_stream(uint32_t len_bytes, int fd, int fd_out) {
     struct packetn_port *p;
     ASSERT(p = malloc(sizeof(*p)));
     memset(p,0,sizeof(*p));
@@ -328,10 +329,11 @@ struct port *open_packetn_stream(uint32_t len_bytes, int fd, int fd_out) {
     p->p.p.fd_out = fd_out;
     p->p.p.read  = (port_read_fn)packetn_read;
     p->p.p.write = (port_write_fn)packetn_write;
+    p->p.p.pop   = (port_pop_fn)packetn_pop;
     p->len_bytes = len_bytes;
     return &p->p.p;
 }
-struct port *open_packetn_tty(uint32_t len_bytes, const char *dev) {
+struct port *port_open_packetn_tty(uint32_t len_bytes, const char *dev) {
     int fd;
     ASSERT_ERRNO(fd = open(dev, O_RDWR | O_NONBLOCK));
 
@@ -348,7 +350,7 @@ struct port *open_packetn_tty(uint32_t len_bytes, const char *dev) {
 
     ASSERT(0 == ioctl(fd, TCSETS2, &tio));
 
-    return open_packetn_stream(len_bytes, fd, fd);
+    return port_open_packetn_stream(len_bytes, fd, fd);
 }
 
 #endif
@@ -407,6 +409,9 @@ static ssize_t slip_pop(struct slip_port *p, uint8_t *buf, ssize_t len) {
         }
     }
 
+    LOG("slip_pop: "); log_hex(&p->p.buf[0], in);
+
+
     // 2. Shift the data buffer
     memmove(&p->p.buf[0], &p->p.buf[in], p->p.count-in);
     p->p.count -= in;
@@ -414,7 +419,7 @@ static ssize_t slip_pop(struct slip_port *p, uint8_t *buf, ssize_t len) {
     return out;
 }
 static ssize_t slip_read(struct packetn_port *p, uint8_t *buf, ssize_t len) {
-    return pop_read((packet_pop_t)slip_pop, &p->p, buf, len);
+    return pop_read((port_pop_fn)slip_pop, &p->p, buf, len);
 }
 
 static ssize_t slip_write(struct slip_port *p, uint8_t *buf, ssize_t len) {
@@ -445,10 +450,12 @@ static ssize_t slip_write(struct slip_port *p, uint8_t *buf, ssize_t len) {
     }
     tmp[out++] = SLIP_END;
 
-    assert_write(p->p.p.fd_out, buf, out);
+    LOG("slip_write: "); log_hex(tmp, out);
+
+    assert_write(p->p.p.fd_out, tmp, out);
     return out;
 }
-struct port *open_slip_stream(int fd, int fd_out) {
+struct port *port_open_slip_stream(int fd, int fd_out) {
     struct slip_port *p;
     ASSERT(p = malloc(sizeof(*p)));
     memset(p,0,sizeof(*p));
@@ -456,9 +463,10 @@ struct port *open_slip_stream(int fd, int fd_out) {
     p->p.p.fd_out = fd_out;
     p->p.p.read  = (port_read_fn)slip_read;
     p->p.p.write = (port_write_fn)slip_write;
+    p->p.p.pop   = (port_pop_fn)slip_pop;
     return &p->p.p;
 }
-struct port *open_slip_tty(const char *dev) {
+struct port *port_open_slip_tty(const char *dev) {
     int fd;
     ASSERT_ERRNO(fd = open(dev, O_RDWR | O_NONBLOCK));
 
@@ -475,7 +483,7 @@ struct port *open_slip_tty(const char *dev) {
 
     ASSERT(0 == ioctl(fd, TCSETS2, &tio));
 
-    return open_slip_stream(fd, fd);
+    return port_open_slip_stream(fd, fd);
 }
 
 #endif
@@ -537,7 +545,7 @@ static ssize_t hex_pop(struct hex_port *p, uint8_t *buf, ssize_t len) {
 
 
 static ssize_t hex_read(struct hex_port *p, uint8_t *buf, ssize_t len) {
-    return pop_read((packet_pop_t)hex_pop, &p->p, buf, len);
+    return pop_read((port_pop_fn)hex_pop, &p->p, buf, len);
 }
 static ssize_t hex_write(struct hex_port *p, uint8_t *buf, ssize_t len) {
     ssize_t out = 0;
@@ -546,7 +554,7 @@ static ssize_t hex_write(struct hex_port *p, uint8_t *buf, ssize_t len) {
     fflush(p->f_out);
     return out;
 }
-struct port *open_hex_stream(int fd, int fd_out) {
+struct port *port_open_hex_stream(int fd, int fd_out) {
     struct hex_port *p;
     ASSERT(p = malloc(sizeof(*p)));
     memset(p,0,sizeof(*p));
@@ -554,6 +562,7 @@ struct port *open_hex_stream(int fd, int fd_out) {
     p->p.p.fd_out = fd_out;
     p->p.p.read  = (port_read_fn)hex_read;
     p->p.p.write = (port_write_fn)hex_write;
+    p->p.p.pop   = (port_pop_fn)hex_pop;
     p->f_out = fdopen(fd_out, "w");
     return &p->p.p;
 }
@@ -567,7 +576,7 @@ struct port *open_hex_stream(int fd, int fd_out) {
  * packet to the other port.  Any other processing behavior is left to
  * application code that uses packet_bridge as a library.. */
 
-void packet_forward(struct port_forward_ctx *x, int from, const uint8_t *buf, ssize_t len) {
+void packet_forward(struct packet_handle_ctx *x, int from, const uint8_t *buf, ssize_t len) {
     int to = (from == 0) ? 1 : 0;
     x->port[to]->write(x->port[to], buf, len);
 }
@@ -579,8 +588,8 @@ void packet_forward(struct port_forward_ctx *x, int from, const uint8_t *buf, ss
 
 /***** 3. FRAMEWORK */
 
-void packet_loop(port_forward_fn forward,
-                 struct port_forward_ctx *ctx) {
+void packet_loop(packet_handle_fn handle,
+                 struct packet_handle_ctx *ctx) {
     const char progress[] = "-\\|/";
     uint32_t count = 0;
 
@@ -600,26 +609,35 @@ void packet_loop(port_forward_fn forward,
             if(pfd[i].revents & POLLIN) {
                 struct port *in  = ctx->port[i];
 
+                /* The read calls the underlying OS read method only
+                 * once, so we are guaranteed to not block. */
                 int rlen = in->read(in, buf, sizeof(buf));
                 if (rlen) {
-                    //LOG("%d: %d\n", i, rlen);
-                    //log_packet(buf, rlen);
-
-                    // out->write(out, buf, rlen);
-                    forward(ctx, i, buf, rlen);
-
-                    //LOG("\r%c (%d)", progress[count % 4], count);
+                    handle(ctx, i, buf, rlen);
                     count++;
                 }
                 else {
                     /* Port handler read data but dropped it. */
+                }
+
+                /* For streaming ports, it is possible that the OS
+                 * read method returned multiple packets, so we pop
+                 * them one by one. */
+                if (in->pop) {
+                    while((rlen = in->pop(in, buf, sizeof(buf)))) {
+                        handle(ctx, i, buf, rlen);
+                        count++;
+                    }
                 }
             }
         }
     }
 }
 
-struct port *from_portspec(char *spec) {
+struct port *port_open(const char *spec_ro) {
+    char spec[strlen(spec_ro)+1];
+    strcpy(spec, spec_ro);
+
     const char delim[] = ":";
     char *tok;
     ASSERT(tok = strtok(spec, delim));
@@ -629,7 +647,7 @@ struct port *from_portspec(char *spec) {
         const char *tapdev = tok;
         ASSERT(NULL == (tok = strtok(NULL, delim)));
         //LOG("TAP:%s\n", tapdev);
-        return open_tap(tapdev);
+        return port_open_tap(tapdev);
     }
 
     if (!strcmp(tok, "UDP-LISTEN")) {
@@ -637,7 +655,7 @@ struct port *from_portspec(char *spec) {
         uint16_t port = atoi(tok);
         ASSERT(NULL == (tok = strtok(NULL, delim)));
         //LOG("UDP-LISTEN:%d\n", port);
-        return open_udp(port);
+        return port_open_udp(port);
     }
 
     if (!strcmp(tok, "UDP")) {
@@ -648,7 +666,7 @@ struct port *from_portspec(char *spec) {
         ASSERT(NULL == (tok = strtok(NULL, delim)));
         //LOG("UDP-LISTEN:%s:%d\n", host, port);
 
-        struct port *p = open_udp(0); // don't spec port here
+        struct port *p = port_open_udp(0); // don't spec port here
         struct udp_port *up = (void*)p;
 
         struct hostent *hp;
@@ -679,16 +697,18 @@ struct port *from_portspec(char *spec) {
     if (!strcmp(tok, "TTY")) {
         ASSERT(tok = strtok(NULL, delim));
         if (!strcmp("slip", tok)) {
+            ASSERT(tok = strtok(NULL, delim));
             const char *dev = tok;
             ASSERT(NULL == (tok = strtok(NULL, delim)));
-            return open_slip_tty(dev);
+            LOG("port_open_slip_tty(%s)\n", dev);
+            return port_open_slip_tty(dev);
         }
         else {
             uint16_t len_bytes = atoi(tok);
             ASSERT(tok = strtok(NULL, delim));
             const char *dev = tok;
             ASSERT(NULL == (tok = strtok(NULL, delim)));
-            return open_packetn_tty(len_bytes, dev);
+            return port_open_packetn_tty(len_bytes, dev);
         }
     }
 
@@ -696,18 +716,18 @@ struct port *from_portspec(char *spec) {
         ASSERT(tok = strtok(NULL, delim));
         if (!strcmp("slip", tok)) {
             ASSERT(NULL == (tok = strtok(NULL, delim)));
-            return open_slip_stream(0, 1);
+            return port_open_slip_stream(0, 1);
         }
         else {
             uint16_t len_bytes = atoi(tok);
             ASSERT(NULL == (tok = strtok(NULL, delim)));
-            return open_packetn_stream(len_bytes, 0, 1);
+            return port_open_packetn_stream(len_bytes, 0, 1);
         }
     }
 
     if (!strcmp(tok, "HEX")) {
         ASSERT(NULL == (tok = strtok(NULL, delim)));
-        return open_hex_stream(0, 1);
+        return port_open_hex_stream(0, 1);
     }
 
     // FIXME: debug hex output/input
@@ -718,12 +738,12 @@ struct port *from_portspec(char *spec) {
 int packet_forward_main(int argc, char **argv) {
     ASSERT(argc > 2);
     struct port *port[2];
-    struct port_forward_ctx ctx = {
+    struct packet_handle_ctx ctx = {
         .nb_ports = 2,
         .port = port
     };
-    ASSERT(port[0] = from_portspec(argv[1]));
-    ASSERT(port[1] = from_portspec(argv[2]));
+    ASSERT(port[0] = port_open(argv[1]));
+    ASSERT(port[1] = port_open(argv[2]));
     packet_loop(packet_forward, &ctx);
 }
 

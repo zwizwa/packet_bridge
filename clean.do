@@ -1,1 +1,2 @@
-rm -f *~ *.elf
+rm -f *~ *.elf *.o
+

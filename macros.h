@@ -13,6 +13,7 @@ ssize_t raw_write(int fd, const void *buf, size_t count);
 
 
 #ifndef LOG
+#include <stdio.h>
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
 #endif
 #ifndef ERROR
