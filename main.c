@@ -2,5 +2,5 @@
 // We don't provide processing here, just proxying.
 #include "packet_bridge.h"
 int main(int argc, char **argv) {
-    return packet_bridge_forward_main(argc, argv);
+    return packet_forward_main(argc, argv);
 }

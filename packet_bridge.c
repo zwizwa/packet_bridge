@@ -98,7 +98,7 @@ static ssize_t tap_write(struct port *p, const uint8_t *buf, ssize_t len) {
     return write(p->fd, buf, len);
 }
 
-static inline struct port *open_tap(const char *dev) {
+struct port *open_tap(const char *dev) {
     int fd;
     ASSERT_ERRNO(fd = open("/dev/net/tun", O_RDWR));
     struct ifreq ifr = { .ifr_flags = IFF_TAP | IFF_NO_PI };
@@ -167,7 +167,7 @@ static ssize_t udp_write(struct udp_port *p, uint8_t *buf, ssize_t len) {
     return wlen;
 }
 
-static inline struct port *open_udp(uint16_t port) {
+struct port *open_udp(uint16_t port) {
     int fd;
     ASSERT_ERRNO(fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
     if(port) {
@@ -188,8 +188,8 @@ static inline struct port *open_udp(uint16_t port) {
     memset(p,0,sizeof(*p));
     p->p.fd = fd;
     p->p.fd_out = fd;
-    p->p.read  = (port_read_t)udp_read;
-    p->p.write = (port_write_t)udp_write;
+    p->p.read  = (port_read_fn)udp_read;
+    p->p.write = (port_write_fn)udp_write;
 
     return &p->p;
 }
@@ -320,18 +320,18 @@ static ssize_t packetn_write(struct packetn_port *p, uint8_t *buf, ssize_t len) 
     //LOG("packetn_write %d (done)\n", len);
     return len + p->len_bytes;
 }
-static inline struct port *open_packetn_stream(uint32_t len_bytes, int fd, int fd_out) {
+struct port *open_packetn_stream(uint32_t len_bytes, int fd, int fd_out) {
     struct packetn_port *p;
     ASSERT(p = malloc(sizeof(*p)));
     memset(p,0,sizeof(*p));
     p->p.p.fd = fd;
     p->p.p.fd_out = fd_out;
-    p->p.p.read  = (port_read_t)packetn_read;
-    p->p.p.write = (port_write_t)packetn_write;
+    p->p.p.read  = (port_read_fn)packetn_read;
+    p->p.p.write = (port_write_fn)packetn_write;
     p->len_bytes = len_bytes;
     return &p->p.p;
 }
-static inline struct port *open_packetn_tty(uint32_t len_bytes, const char *dev) {
+struct port *open_packetn_tty(uint32_t len_bytes, const char *dev) {
     int fd;
     ASSERT_ERRNO(fd = open(dev, O_RDWR | O_NONBLOCK));
 
@@ -448,17 +448,17 @@ static ssize_t slip_write(struct slip_port *p, uint8_t *buf, ssize_t len) {
     assert_write(p->p.p.fd_out, buf, out);
     return out;
 }
-static inline struct port *open_slip_stream(int fd, int fd_out) {
+struct port *open_slip_stream(int fd, int fd_out) {
     struct slip_port *p;
     ASSERT(p = malloc(sizeof(*p)));
     memset(p,0,sizeof(*p));
     p->p.p.fd = fd;
     p->p.p.fd_out = fd_out;
-    p->p.p.read  = (port_read_t)slip_read;
-    p->p.p.write = (port_write_t)slip_write;
+    p->p.p.read  = (port_read_fn)slip_read;
+    p->p.p.write = (port_write_fn)slip_write;
     return &p->p.p;
 }
-static inline struct port *open_slip_tty(const char *dev) {
+struct port *open_slip_tty(const char *dev) {
     int fd;
     ASSERT_ERRNO(fd = open(dev, O_RDWR | O_NONBLOCK));
 
@@ -546,14 +546,14 @@ static ssize_t hex_write(struct hex_port *p, uint8_t *buf, ssize_t len) {
     fflush(p->f_out);
     return out;
 }
-static inline struct port *open_hex_stream(int fd, int fd_out) {
+struct port *open_hex_stream(int fd, int fd_out) {
     struct hex_port *p;
     ASSERT(p = malloc(sizeof(*p)));
     memset(p,0,sizeof(*p));
     p->p.p.fd = fd;
     p->p.p.fd_out = fd_out;
-    p->p.p.read  = (port_read_t)hex_read;
-    p->p.p.write = (port_write_t)hex_write;
+    p->p.p.read  = (port_read_fn)hex_read;
+    p->p.p.write = (port_write_fn)hex_write;
     p->f_out = fdopen(fd_out, "w");
     return &p->p.p;
 }
@@ -561,13 +561,13 @@ static inline struct port *open_hex_stream(int fd, int fd_out) {
 
 
 
-/***** 2. PROCESSING */
+/***** 2. PACKET HANDLER */
 
 /* Default behavior for the stand-alone program is to just forward a
  * packet to the other port.  Any other processing behavior is left to
  * application code that uses packet_bridge as a library.. */
 
-void packet_bridge_forward(struct port_forward_ctx *x, int from, const uint8_t *buf, ssize_t len) {
+void packet_forward(struct port_forward_ctx *x, int from, const uint8_t *buf, ssize_t len) {
     int to = (from == 0) ? 1 : 0;
     x->port[to]->write(x->port[to], buf, len);
 }
@@ -579,8 +579,8 @@ void packet_bridge_forward(struct port_forward_ctx *x, int from, const uint8_t *
 
 /***** 3. FRAMEWORK */
 
-void packet_bridge_loop(port_forward_t forward,
-                        struct port_forward_ctx *ctx) {
+void packet_loop(port_forward_fn forward,
+                 struct port_forward_ctx *ctx) {
     const char progress[] = "-\\|/";
     uint32_t count = 0;
 
@@ -715,7 +715,7 @@ struct port *from_portspec(char *spec) {
     ERROR("unknown type %s\n", tok);
 }
 
-int packet_bridge_forward_main(int argc, char **argv) {
+int packet_forward_main(int argc, char **argv) {
     ASSERT(argc > 2);
     struct port *port[2];
     struct port_forward_ctx ctx = {
@@ -724,7 +724,7 @@ int packet_bridge_forward_main(int argc, char **argv) {
     };
     ASSERT(port[0] = from_portspec(argv[1]));
     ASSERT(port[1] = from_portspec(argv[2]));
-    packet_bridge_loop(packet_bridge_forward, &ctx);
+    packet_loop(packet_forward, &ctx);
 }
 
 
